@@ -13,6 +13,7 @@ from .api.client import FcClient
 from .api.endpoints import EndpointRegistry
 from .api.errors import FcAuthError, FcError
 from .const import (
+    CONF_COUNTRY_CODE,
     CONF_EMAIL,
     CONF_ENDPOINTS_FILE,
     CONF_FAMILY_ID,
@@ -37,13 +38,15 @@ def _protocol_secrets(hass=None) -> dict:
         data = {}
 
     return {
-        "secure_data": _load_protocol_secret(_EntryStub(), "secure_data"),
-        "private_key_b64": _load_protocol_secret(_EntryStub(), "private_key"),
+        "secure_data": _load_protocol_secret(hass, _EntryStub(), "secure_data"),
+        "private_key_b64": _load_protocol_secret(hass, _EntryStub(), "private_key"),
     }
+
 
 STEP_USER_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): str,
+        vol.Optional(CONF_COUNTRY_CODE, default="34"): str,
         vol.Optional(CONF_PASSWORD, default=""): str,
         vol.Optional(CONF_TOKEN, default=""): str,
         vol.Optional(CONF_FAMILY_ID, default=""): str,
@@ -55,7 +58,6 @@ STEP_USER_SCHEMA = vol.Schema(
         vol.Optional(CONF_ENDPOINTS_FILE, default=""): str,
     }
 )
-
 REAUTH_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_PASSWORD): str,
@@ -72,15 +74,19 @@ class FCSmartHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         return FCSmartHomeOptionsFlow(config_entry)
 
     async def _validate(
-        self, email: str, password: str, region: str, endpoints_file: str
+        self, email: str, password: str, region: str, endpoints_file: str,
+        country_code: str = "34",
     ) -> dict:
         import asyncio
 
         registry = EndpointRegistry.load(region, endpoints_file or None)
-        secrets = await asyncio.to_thread(_protocol_secrets)
-        client = FcClient(email, password, region, registry, **secrets)
+        secrets = await asyncio.to_thread(_protocol_secrets, self.hass)
         if not secrets.get("secure_data") or not secrets.get("private_key_b64"):
             return {"errors": {"base": "missing_protocol_secrets"}}
+        client = FcClient(
+            email, password, region, registry,
+            country_code=country_code, **secrets,
+        )
         try:
             await client.login()
         except FcAuthError:
@@ -100,6 +106,7 @@ class FCSmartHomeConfigFlow(ConfigFlow, domain=DOMAIN):
             password = user_input.get(CONF_PASSWORD, "").strip()
             region = user_input.get(CONF_REGION, "us")
             endpoints_file = user_input.get(CONF_ENDPOINTS_FILE, "")
+            country_code = (user_input.get(CONF_COUNTRY_CODE) or "34").strip()
 
             if token:
                 # Direct Token / App Session setup (for sessions extracted
@@ -117,8 +124,11 @@ class FCSmartHomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
                 import asyncio as _asyncio
                 registry = EndpointRegistry.load(region, endpoints_file or None)
-                secrets = await _asyncio.to_thread(_protocol_secrets)
-                client = FcClient(email, password, region, registry, **secrets)
+                secrets = await _asyncio.to_thread(_protocol_secrets, self.hass)
+                client = FcClient(
+                    email, password, region, registry,
+                    country_code=country_code, **secrets,
+                )
                 client.tokens = TokenPair(access_token=token, family_id=family_id or None)
                 try:
                     if password and secrets.get("secure_data"):
@@ -163,6 +173,7 @@ class FCSmartHomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     password,
                     region,
                     endpoints_file,
+                    country_code,
                 )
                 if result.get("ok"):
                     await self.async_set_unique_id(email.lower())
@@ -200,6 +211,7 @@ class FCSmartHomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 data[CONF_PASSWORD],
                 data.get(CONF_REGION, "us"),
                 data.get(CONF_ENDPOINTS_FILE, ""),
+                data.get(CONF_COUNTRY_CODE, "34"),
             )
             if result.get("ok"):
                 return self.async_update_reload_and_abort(

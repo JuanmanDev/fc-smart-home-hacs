@@ -154,6 +154,60 @@ def test_parse_status_int_and_bool():
     assert status.locked is True and status.battery == 90
 
 
+def test_sticky_unlocked_state_becomes_locked():
+    """Auto-relock model: cloud lockState=0 sticks after last unlock event.
+
+    Within the relock window the status must report unlocked; after the
+    window it must revert to locked even though the cloud never sends a
+    relock message.
+    """
+    c = make_client()
+
+    class _Dev:
+        raw = {"lockState": 0, "doorState": False, "battery": 50}
+        battery = 50
+        device_id = "d1"
+
+    async def fake_get_device(device_id):
+        return _Dev()
+
+    c.get_device = fake_get_device
+
+    from datetime import datetime, timedelta, timezone
+
+    from custom_components.fc_smarthome.api.models import LockEvent, LockEventType
+
+    now = datetime.now(timezone.utc)
+    fresh = LockEvent(
+        type=LockEventType.UNLOCKED, device_id="d1",
+        timestamp=now - timedelta(seconds=2), raw={},
+    )
+    stale = LockEvent(
+        type=LockEventType.UNLOCKED, device_id="d1",
+        timestamp=now - timedelta(seconds=120), raw={},
+    )
+
+    import asyncio
+
+    c._last_events["d1"] = [fresh]  # newest-first
+    status = asyncio.run(c.get_device_status("d1"))
+    assert status.locked is False  # unlock 2s ago -> genuinely unlocked
+
+    c._last_events["d1"] = [stale]
+    status = asyncio.run(c.get_device_status("d1"))
+    assert status.locked is True  # unlock 2 min ago -> auto-relocked
+
+
+def test_lock_command_is_safe_noop():
+    """The cloud protocol has no lock command; lock() must NOT open the door."""
+    c = make_client()
+    import asyncio
+
+    result = asyncio.run(c.lock("d1"))
+    assert result.success is True
+    assert "openLock" not in (result.message or "")
+
+
 def test_parse_users_int_type():
     c = make_client()
     # verified getLockUserList/v2 shape
@@ -292,6 +346,12 @@ def test_event_dedup_and_bell_tracking():
     coord.access_log = {}
     coord.bell_active = {}
     coord._seen_log_ids = {}
+    coord.doorbell_last_ring = {}
+    coord.doorbell_ring_count = {}
+    coord.last_unlock_time = {}
+    coord.last_unlock_user = {}
+    coord.last_unlock_method = {}
+    coord.last_alarm = {}
 
     class _Bus:
         def __init__(self):
@@ -328,6 +388,10 @@ def test_event_dedup_and_bell_tracking():
     assert coord.bell_active["d1"] is not False and coord.bell_active["d1"] is not None
     assert coord.last_event["d1"].type is LockEventType.BELL
     assert len(coord.access_log["d1"]) == 2
+    # unlock tracking derived from the fired events (newest-wins)
+    assert coord.last_unlock_user["d1"] == "Mom"
+    assert coord.last_unlock_method["d1"] == "finger"
+    assert coord.doorbell_ring_count["d1"] == 1
 
     # replaying the same batch must not fire anything new
     coord._process_new_events("d1", batch1)
@@ -341,6 +405,40 @@ def test_event_dedup_and_bell_tracking():
     assert len(hass.bus.fired) == 3
     fired_types = [p["event_type"] for _, p in hass.bus.fired]
     assert "unlocked" in fired_types and "bell" in fired_types and "locked" in fired_types
+
+    # history backfill order: events arrive oldest-first here; the newest
+    # bell must win regardless of firing order
+    backfill = [
+        ev(LockEventType.BELL, None, ts="2026-01-05T08:00:00+00:00"),
+        ev(LockEventType.UNLOCKED, "app", user="Dad", ts="2026-01-05T09:00:00+00:00"),
+        ev(LockEventType.BELL, None, ts="2026-01-06T12:00:00+00:00"),
+        ev(LockEventType.UNLOCKED, "finger", user="Kid", ts="2026-01-06T13:00:00+00:00"),
+    ]
+    coord._process_new_events("d1", backfill)
+    assert coord.doorbell_last_ring["d1"] == parse_ts("2026-01-06T12:00:00+00:00")
+    assert coord.last_unlock_user["d1"] == "Kid"
+    assert coord.doorbell_ring_count["d1"] == 3
+
+    # prime_from_history derives the same state from a raw event list
+    coord2 = FcCoordinator.__new__(FcCoordinator)
+    coord2.devices = {}
+    coord2.statuses = {}
+    coord2.last_event = {}
+    coord2.bell_active = {}
+    coord2.access_log = {}
+    coord2.doorbell_last_ring = {}
+    coord2.doorbell_ring_count = {}
+    coord2.last_unlock_time = {}
+    coord2.last_unlock_user = {}
+    coord2.last_unlock_method = {}
+    coord2.last_alarm = {}
+    coord2._seen_log_ids = {}
+    coord2._process_new_events("d2", list(reversed(backfill)))  # fill d2 log
+    coord2.doorbell_ring_count = {}  # simulate fresh restart
+    coord2.prime_from_history("d2", backfill)
+    assert coord2.doorbell_last_ring["d2"] == parse_ts("2026-01-06T12:00:00+00:00")
+    assert coord2.last_unlock_user["d2"] == "Kid"
+    assert coord2.doorbell_ring_count["d2"] == 2  # 2 bells in the access log
 
 
 def test_bell_expiry():
@@ -795,7 +893,7 @@ async def test_coordinator_sync_ble_records_simulation():
     coord.user_cache = {}
 
     class MockTransport:
-        async def handshake(self, user_id):
+        async def handshake(self, user_id=None, user_id_str=None, **_):
             return {
                 "firmware_version": "V4.5.11",
                 "model": "L5-WIFI",

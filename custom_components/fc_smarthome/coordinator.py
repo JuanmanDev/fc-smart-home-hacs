@@ -54,6 +54,10 @@ _LOGGER = logging.getLogger(__name__)
 
 ACCESS_LOG_MAX = 200
 BELL_LATCH_SECONDS = 30
+# history polling window (ms): fetch the last 7 days each cycle — the
+# vendor API needs a millis-epoch fromTime (seconds values return the
+# full history; verified live 2026-09-11) and the pipeline dedups events
+HISTORY_POLL_WINDOW_MS = 7 * 86_400_000
 
 
 class FcCoordinator(DataUpdateCoordinator):
@@ -132,6 +136,32 @@ class FcCoordinator(DataUpdateCoordinator):
             for device_id, device in list(self.devices.items()):
                 if not cloud_auth_failed:
                     try:
+                        # user list once per device: lets get_history enrich
+                        # UnlockMethod.UNKNOWN events (cloud only reports the
+                        # credential owner; the user list has the type)
+                        await self.client._ensure_user_cache(device_id)
+                    except FcAuthError:
+                        cloud_auth_failed = True
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug(
+                            "user list fetch failed for %s: %s", device_id, err
+                        )
+                if not cloud_auth_failed:
+                    try:
+                        # history first: unlock events feed the auto-relock
+                        # window used by get_device_status
+                        events = await self.client.get_history(
+                            device_id,
+                            limit=30,
+                            from_ms=int(time.time() * 1000) - HISTORY_POLL_WINDOW_MS,
+                        )
+                        self._process_new_events(device_id, events)
+                    except FcAuthError:
+                        cloud_auth_failed = True
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.debug("history fetch failed for %s", device_id)
+                if not cloud_auth_failed:
+                    try:
                         self.statuses[device_id] = await self.client.get_device_status(
                             device_id
                         )
@@ -150,14 +180,6 @@ class FcCoordinator(DataUpdateCoordinator):
                         tamper=False,
                         low_battery=False,
                     )
-                if not cloud_auth_failed:
-                    try:
-                        events = await self.client.get_history(device_id, limit=30)
-                        self._process_new_events(device_id, events)
-                    except FcAuthError:
-                        cloud_auth_failed = True
-                    except Exception:  # noqa: BLE001
-                        _LOGGER.debug("history fetch failed for %s", device_id)
             return {
                 "devices": self.devices,
                 "statuses": self.statuses,
@@ -200,7 +222,9 @@ class FcCoordinator(DataUpdateCoordinator):
         for ev in fresh:
             log.appendleft(ev.to_dict())
         self.last_event[device_id] = fresh[0]
-        for ev in fresh:
+        # fire oldest-first so per-event state tracking (doorbell ring,
+        # last unlock) ends up with the NEWEST value as the final write
+        for ev in reversed(fresh):
             self._fire_event(ev)
         _LOGGER.debug("fired %d new events for %s", len(fresh), device_id)
 
@@ -246,12 +270,26 @@ class FcCoordinator(DataUpdateCoordinator):
         if ev.type is LockEventType.BELL:
             now = time.time()
             self.bell_active[device_id] = now
-            if "doorbell_last_ring" not in self.__dict__:
-                self.doorbell_last_ring = {}
-            if "doorbell_ring_count" not in self.__dict__:
-                self.doorbell_ring_count = {}
-            self.doorbell_last_ring[device_id] = ev.timestamp or datetime.now(timezone.utc)
-            self.doorbell_ring_count[device_id] = self.doorbell_ring_count.get(device_id, 0) + 1
+            prev_ring = self.doorbell_last_ring.get(device_id)
+            # keep the NEWEST ring timestamp (older events may fire after
+            # newer ones during history backfill)
+            if prev_ring is None or (ev.timestamp and ev.timestamp > prev_ring):
+                self.doorbell_last_ring[device_id] = (
+                    ev.timestamp or datetime.now(timezone.utc)
+                )
+            self.doorbell_ring_count[device_id] = (
+                self.doorbell_ring_count.get(device_id, 0) + 1
+            )
+        if ev.type is LockEventType.UNLOCKED:
+            prev_time = self.last_unlock_time.get(device_id)
+            if ev.timestamp and (prev_time is None or ev.timestamp > prev_time):
+                self.last_unlock_time[device_id] = ev.timestamp
+                self.last_unlock_user[device_id] = ev.user or (
+                    f"User {ev.user_id}" if ev.user_id else None
+                )
+                self.last_unlock_method[device_id] = (
+                    ev.method.value if ev.method else "unknown"
+                )
         hass_obj = self.__dict__.get("hass")
         if hass_obj and hasattr(hass_obj, "bus") and hasattr(hass_obj.bus, "async_fire"):
             hass_obj.bus.async_fire(EVENT_FC_EVENT, payload)
@@ -269,6 +307,35 @@ class FcCoordinator(DataUpdateCoordinator):
         self._process_new_events_single(ev)
         if _HA_AVAILABLE and "async_update_listeners" in self.__dict__:
             self.async_update_listeners()
+
+    def prime_from_history(self, device_id: str, events: list[LockEvent]) -> None:
+        """Derive session-state (last unlock, last bell, ring count) from
+        the full cloud history so sensors are correct right after load,
+        instead of accumulating them only from events seen this session."""
+        unlocks = [e for e in events if e.type is LockEventType.UNLOCKED and e.timestamp]
+        bells = [e for e in events if e.type is LockEventType.BELL and e.timestamp]
+        if unlocks:
+            newest = max(unlocks, key=lambda e: e.timestamp)
+            self.last_unlock_time[device_id] = newest.timestamp
+            self.last_unlock_user[device_id] = newest.user or (
+                f"User {newest.user_id}" if newest.user_id else None
+            )
+            self.last_unlock_method[device_id] = (
+                newest.method.value if newest.method else "unknown"
+            )
+        if bells:
+            newest_bell = max(bells, key=lambda e: e.timestamp)
+            prev = self.doorbell_last_ring.get(device_id)
+            if prev is None or newest_bell.timestamp > prev:
+                self.doorbell_last_ring[device_id] = newest_bell.timestamp
+        # count all bells present in the retained access log (covers
+        # restarts: the count continues from history instead of resetting)
+        log = self.access_log.get(device_id)
+        known_bells = sum(
+            1 for e in log or [] if e.get("event_type") == LockEventType.BELL.value
+        )
+        if known_bells > self.doorbell_ring_count.get(device_id, 0):
+            self.doorbell_ring_count[device_id] = known_bells
 
     def handle_ble_advertisement(self, device_id: str, service_info: Any) -> None:
         """Handle incoming BLE advertisement from HA bluetooth scanner."""
@@ -351,14 +418,15 @@ class FcCoordinator(DataUpdateCoordinator):
         _LOGGER.debug("Starting BLE sync for %s (%s)", device_id, ble_mac)
         try:
             transport = await self.router.ble_manager.transport(ble_mac)
-            user_id_bind = (
-                dev.capabilities.get("deviceBindUserId")
-                or dev.capabilities.get("userId")
-                or getattr(self.client.tokens, "user_id", None)
-                or device_id
-                or "00000000000000000000000000000000"
+            # handshake identity = deviceBindUserId (verified from the app
+            # bundle: $plugin.* calls all pass device.deviceBindUserId);
+            # fall back to the transport's bound lock_id then deviceuuid
+            bind_uid = (
+                (dev.raw.get("deviceBindUserId") if dev else None)
+                or dev.capabilities.get("deviceBindUserId")
             )
-            info = await transport.handshake(user_id=user_id_bind)
+            identity = bind_uid or getattr(transport, "lock_id", None) or device_id
+            info = await transport.handshake(user_id_str=identity)
             _LOGGER.debug("BLE handshake success for %s: %s", device_id, info)
 
             if info.get("firmware_version"):

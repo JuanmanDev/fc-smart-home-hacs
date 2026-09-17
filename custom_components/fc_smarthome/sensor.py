@@ -196,11 +196,16 @@ class FCLockFirmwareSensor(FCSensorBase):
 
     @property
     def native_value(self) -> str | None:
-        dev = self.coordinator.devices.get(self.device_id)
         fw = self.coordinator.device_firmware.get(self.device_id)
         if fw:
             return fw
-        return dev.capabilities.get("firmwareVersion") if dev else None
+        dev = self.coordinator.devices.get(self.device_id)
+        if not dev:
+            return None
+        caps = dev.capabilities
+        # cloud payload uses lowercase 'firmwareversion'; keep the older
+        # spelling as a fallback
+        return caps.get("firmwareversion") or caps.get("firmwareVersion")
 
 
 class FCLockMacSensor(FCSensorBase):

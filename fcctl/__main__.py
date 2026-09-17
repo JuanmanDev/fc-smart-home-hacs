@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import json
 import logging
@@ -15,8 +16,14 @@ import os
 import sys
 from pathlib import Path
 
+# Fix Windows console UTF-8 output (for emojis in device/user names)
+if sys.platform == "win32":
+    with contextlib.suppress(Exception):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Allow running from repo root without installation
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from custom_components.fc_smarthome.api.client import FcClient  # noqa: E402
 from custom_components.fc_smarthome.api.const import USER_TYPE_INT_MAP  # noqa: E402
@@ -25,6 +32,22 @@ from custom_components.fc_smarthome.api.errors import FcError  # noqa: E402
 from custom_components.fc_smarthome.api.models import LockUserType  # noqa: E402
 
 TOKEN_FILE = Path.home() / ".fcsmarthome" / "tokens.json"
+
+
+def _load_env_file() -> None:
+    """Load .env file from cwd or repo root if present without overriding existing env."""
+    for candidate in [Path.cwd() / ".env", Path(__file__).resolve().parents[1] / ".env"]:
+        if candidate.is_file():
+            try:
+                for line in candidate.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip())
+                break
+            except Exception:
+                pass
 
 
 def out_json(data) -> None:
@@ -41,17 +64,31 @@ def out_json(data) -> None:
 
 
 def build_client(args) -> FcClient:
-    email = args.email or os.environ.get("FC_EMAIL")
-    password = args.password or os.environ.get("FC_PASSWORD")
-    if args.email and not args.password:
+    _load_env_file()
+    account = (
+        getattr(args, "phone", None)
+        or getattr(args, "email", None)
+        or os.environ.get("FC_PHONE")
+        or os.environ.get("FC_EMAIL")
+    )
+    password = getattr(args, "password", None) or os.environ.get("FC_PASSWORD")
+    if (getattr(args, "email", None) or getattr(args, "phone", None)) and not password:
         password = getpass.getpass("Password: ")
-    registry = EndpointRegistry.load(getattr(args, "region", "us"), getattr(args, "endpoints_file", None))
-    if not email or not password:
+    region = getattr(args, "region", None) or os.environ.get("FC_REGION", "us")
+    country_code = os.environ.get("FC_CC", "34")
+    registry = EndpointRegistry.load(region, getattr(args, "endpoints_file", None))
+    if not account or not password:
         # try stored tokens only if explicitly allowed
         if not (TOKEN_FILE.exists() and getattr(args, "use_stored", False)):
-            print("error: provide --email/--password or FC_EMAIL/FC_PASSWORD env vars", file=sys.stderr)
+            print("error: provide --phone/--email/--password or set FC_PHONE/FC_EMAIL/FC_PASSWORD in .env", file=sys.stderr)
             sys.exit(2)
-    client = FcClient(email or "", password or "", getattr(args, "region", "us"), registry)
+    client = FcClient(
+        account or "",
+        password or "",
+        region,
+        registry,
+        country_code=country_code,
+    )
     if TOKEN_FILE.exists() and getattr(args, "use_stored", False):
         try:
             data = json.loads(TOKEN_FILE.read_text())
@@ -415,15 +452,17 @@ async def cmd_discover(args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    _load_env_file()
     parser = argparse.ArgumentParser(
         prog="fcctl",
         description="FC SmartHome (Fingerchip) control CLI",
     )
+    parser.add_argument("--phone", help="account phone (or FC_PHONE)")
     parser.add_argument("--email", help="account email (or FC_EMAIL)")
     parser.add_argument("--password", help="account password (or FC_PASSWORD)")
     parser.add_argument(
         "--region",
-        default="us",
+        default=os.environ.get("FC_REGION", "us"),
         choices=["us", "eu", "cn", "ru", "intl-aws", "test", "test2"],
         help="server channel (from the official app: us/eu/cn/ru -> www.fcsmartlock.com, intl-aws -> 18.219.242.80, test/test2)",
     )

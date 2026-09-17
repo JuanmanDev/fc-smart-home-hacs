@@ -158,3 +158,32 @@ set_child_lock:
       required: true
       selector:
         boolean:
+
+ble_probe:
+  name: BLE probe
+  description: >
+    Diagnostic: scan -> GATT connect -> protocol handshake with the lock over
+    BLE (through the ESPHome Bluetooth proxies). Read-only: does NOT unlock.
+  fields:
+    device_id:
+      name: Device
+      description: The lock device id.
+      required: true
+      example: "1234567890"
+      selector:
+        text:
+
+ble_unlock:
+  name: BLE unlock
+  description: >
+    Unlock the door over BLE via the ESPHome Bluetooth proxies (local channel;
+    works even when the cloud openLock path is asleep). Requires 'local ble'
+    enabled in the integration options.
+  fields:
+    device_id:
+      name: Device
+      description: The lock device id.
+      required: true
+      example: "1234567890"
+      selector:
+        text:

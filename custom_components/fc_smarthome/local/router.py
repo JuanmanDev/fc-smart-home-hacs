@@ -19,6 +19,15 @@ from .lan import FcLanTransport, LanConfig
 _LOGGER = logging.getLogger(__name__)
 
 
+def _normalize_mac(address: str) -> str:
+    """Cloud payloads use raw hex ('341727051920'); bleak uses
+    colon-separated ('34:17:27:05:19:20'). Return the colon form."""
+    raw = address.strip().replace(":", "").replace("-", "").upper()
+    if len(raw) == 12:
+        return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+    return address
+
+
 class FcTransportRouter:
     """Routes commands to the best available transport for a device.
 
@@ -50,9 +59,18 @@ class FcTransportRouter:
         """Associate a device id with a BLE address (from scan)."""
         if not hasattr(self, "_ble_addresses"):
             self._ble_addresses = {}
-        self._ble_addresses[device_id] = address
+        # normalize: cloud payloads carry raw hex (341727051920) while
+        # bleak/HA use colon format (34:17:27:05:19:20)
+        mac = _normalize_mac(address)
+        self._ble_addresses[device_id] = mac
         if self.ble_manager is not None:
-            self.ble_manager._discovered.setdefault(address, None)
+            self.ble_manager._discovered.setdefault(mac, None)
+            self.ble_manager._discovered.setdefault(mac.upper(), None)
+            # keep the handshake identity (cloud lock id) linked to the MAC
+            # so the handshake uses the deviceuuid even when the caller
+            # passes no explicit identity
+            if hasattr(self.ble_manager, "register_lock_id"):
+                self.ble_manager.register_lock_id(mac, device_id)
 
     async def _lan_transport(self, device_id: str) -> FcLanTransport | None:
         endpoint = self.lan_hosts.get(device_id)
@@ -81,6 +99,9 @@ class FcTransportRouter:
             return await self.ble_manager.transport(address)
         except FcLocalError:
             return None
+        except Exception as err:  # noqa: BLE001 - proxies can raise
+            _LOGGER.debug("BLE transport error for %s: %s", device_id, err)
+            return None
 
     async def unlock(self, device_id: str, reason: str = "app") -> ControlResult:
         transport = await self._lan_transport(device_id)
@@ -93,8 +114,23 @@ class FcTransportRouter:
         ble = await self._ble_transport(device_id)
         if ble is not None:
             try:
-                await ble.unlock()
-                return ControlResult(success=True, message="unlocked via BLE")
+                # the handshake identity (lockId) is deviceBindUserId —
+                # the manager registers it per MAC; if the transport's
+                # bound lock_id is the deviceuuid (stale registration),
+                # rebind via the manager's lock_ids table
+                mac = getattr(self, "_ble_addresses", {}).get(device_id)
+                if mac and self.ble_manager is not None:
+                    registered = (
+                        self.ble_manager.lock_ids.get(mac.upper())
+                        or self.ble_manager.lock_ids.get(mac)
+                    )
+                    if registered:
+                        ble.lock_id = registered
+                await ble.handshake()
+                ok = await ble.remote_unlock()
+                if ok:
+                    return ControlResult(success=True, message="unlocked via BLE")
+                _LOGGER.debug("BLE unlock returned failure, falling back to cloud")
             except FcLocalError as err:
                 _LOGGER.debug("BLE unlock failed, falling back to cloud: %s", err)
         return await self.client.unlock(device_id, reason=reason)

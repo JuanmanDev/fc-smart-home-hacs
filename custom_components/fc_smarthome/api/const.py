@@ -19,6 +19,7 @@ CONF_LOCAL_LAN = "local_lan"
 CONF_ENDPOINTS_FILE = "endpoints_file"
 CONF_SECURE_DATA = "secure_data"
 CONF_PRIVATE_KEY = "private_key"
+CONF_COUNTRY_CODE = "country_code"
 
 
 DEFAULT_POLL_INTERVAL = 30
@@ -45,6 +46,8 @@ SERVICE_IMPORT_HISTORY = "import_history"
 SERVICE_RING_BELL = "ring_bell"
 SERVICE_BEEP = "locate_device"
 SERVICE_SET_CHILD_LOCK = "set_child_lock"
+SERVICE_BLE_UNLOCK = "ble_unlock"
+SERVICE_BLE_PROBE = "ble_probe"
 
 # devStatus bitmask decode. Hypothesis derived from sibling Alibaba-Cloud-style
 # lock firmware; bit assignments must be confirmed via tools/HARVEST.md captures.

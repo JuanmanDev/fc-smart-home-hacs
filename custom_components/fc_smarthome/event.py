@@ -73,29 +73,46 @@ class FCEventEntity(CoordinatorEntity, EventEntity):
         }
 
     def _handle_coordinator_update(self) -> None:
-        last = self.coordinator.last_event.get(self.device_id)
-        if last is None:
-            self.async_write_ha_state()
-            return
-        data = {
-            "device_id": self.device_id,
-            "method": last.method.value if last.method else None,
-            "user": last.user,
-            "user_id": last.user_id,
-            "remote": last.remote,
-            "timestamp": last.timestamp.isoformat() if last.timestamp else None,
-            "description": last.description,
-        }
-        key = (
-            last.type.value,
-            data["timestamp"],
-            data["user_id"],
-            data["method"],
-        )
-        if key == self._last_key:
-            self.async_write_ha_state()
-            return
-        self._last_key = key
-        self._recent.appendleft(dict(data, event_type=last.type.value))
-        # advances the `event` attribute -> event-platform triggers fire
-        self._trigger_event(last.type.value, data)
+        log = self.coordinator.access_log.get(self.device_id)
+        if log:
+            # fire every event newer than the last one we already fired,
+            # oldest first (several can arrive in a single poll cycle)
+            pending = []
+            for entry in log:  # newest-first
+                key = (
+                    entry.get("event_type"),
+                    entry.get("timestamp"),
+                    entry.get("user_id"),
+                    entry.get("method"),
+                )
+                if key == self._last_key:
+                    break
+                pending.append((key, entry))
+            if self._last_key is None:
+                # first sync after startup: adopt the existing history
+                # without replaying old events as new triggers
+                if pending:
+                    self._last_key = pending[0][0]
+                    for _key, entry in pending:
+                        self._recent.appendleft(
+                            dict(entry, event_type=entry.get("event_type"))
+                        )
+            else:
+                for key, entry in reversed(pending):
+                    data = {
+                        "device_id": self.device_id,
+                        "method": entry.get("method"),
+                        "user": entry.get("user"),
+                        "user_id": entry.get("user_id"),
+                        "remote": entry.get("remote"),
+                        "timestamp": entry.get("timestamp"),
+                        "description": entry.get("description"),
+                    }
+                    self._recent.appendleft(
+                        dict(data, event_type=entry.get("event_type"))
+                    )
+                    # advances the `event` attribute -> event-platform triggers
+                    self._trigger_event(entry.get("event_type") or "unknown", data)
+                if pending:
+                    self._last_key = pending[0][0]
+        self.async_write_ha_state()

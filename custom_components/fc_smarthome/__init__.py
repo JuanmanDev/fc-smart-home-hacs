@@ -6,6 +6,7 @@ Local BLE is opt-in per entry (options) and augments cloud control.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -13,7 +14,7 @@ try:  # pragma: no cover - HA environment
     import voluptuous as vol
 
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import HomeAssistant, ServiceCall
+    from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
     from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
     from homeassistant.helpers import config_validation as cv
 
@@ -21,7 +22,7 @@ try:  # pragma: no cover - HA environment
 except ImportError:  # library-only environment (CLI, tests)
     _HA_AVAILABLE = False
     vol = None
-    ConfigEntry = HomeAssistant = ServiceCall = None
+    ConfigEntry = HomeAssistant = ServiceCall = SupportsResponse = None
     ConfigEntryNotReady = HomeAssistantError = None
     cv = None
 
@@ -29,6 +30,7 @@ from .api.client import FcClient
 from .api.endpoints import EndpointRegistry
 from .api.models import LockUserType, TokenPair, parse_ts
 from .const import (
+    CONF_COUNTRY_CODE,
     CONF_EMAIL,
     CONF_ENDPOINTS_FILE,
     CONF_LOCAL_BLE,
@@ -46,24 +48,27 @@ from .const import (
     SERVICE_RENAME_USER,
     SERVICE_RING_BELL,
     SERVICE_SET_CHILD_LOCK,
+    SERVICE_BLE_UNLOCK,
+    SERVICE_BLE_PROBE,
 )
 from .coordinator import FcCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _load_protocol_secret(entry, kind: str) -> str | None:
+def _load_protocol_secret(hass, entry, kind: str) -> str | None:
     """Load a protocol secret (secureData / RSA private key).
 
     Order: config entry data -> environment variable -> secrets file.
-    The secrets live in <config dir>/fc_secure_data.json or the repo's
-    .secrets/ directory (gitignored), never in the source tree.
+    Secrets files are looked up in HA's config directory (recommended:
+    `<config>/fc_secure_data.json` and `<config>/fc_app_privkey.b64`) or
+    `~/.fcsmarthome/`. Never inside the source tree.
     """
     import json as _json
     import os
     from pathlib import Path
 
-    if entry.data.get(kind):
+    if entry and entry.data.get(kind):
         return entry.data[kind]
     env_map = {"secure_data": "FC_SECURE_DATA", "private_key": "FC_PRIVATE_KEY_B64"}
     if os.environ.get(env_map.get(kind, "")):
@@ -74,8 +79,8 @@ def _load_protocol_secret(entry, kind: str) -> str | None:
     }
     fname, json_key = names[kind]
     candidates = [
+        Path(hass.config.config_dir) / fname,
         Path.home() / ".fcsmarthome" / fname,
-        Path(__file__).parent.parent.parent.parent / ".secrets" / fname,
         Path.cwd() / ".secrets" / fname,
     ]
     for cand in candidates:
@@ -150,6 +155,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data.get(CONF_REGION, "us"),
         entry.data.get(CONF_ENDPOINTS_FILE) or None,
     )
+
     def _on_token_refreshed(tokens: TokenPair) -> None:
         hass.config_entries.async_update_entry(
             entry,
@@ -160,11 +166,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     import asyncio as _asyncio
 
     secure_data = await _asyncio.to_thread(
-        _load_protocol_secret, entry, "secure_data"
+        _load_protocol_secret, hass, entry, "secure_data"
     )
     private_key_b64 = await _asyncio.to_thread(
-        _load_protocol_secret, entry, "private_key"
+        _load_protocol_secret, hass, entry, "private_key"
     )
+    if not secure_data or not private_key_b64:
+        # the encrypted cloud protocol cannot log in without these
+        raise ConfigEntryNotReady(
+            "FC SmartHome protocol secrets missing: place fc_secure_data.json "
+            "and fc_app_privkey.b64 in the Home Assistant config directory (or "
+            "set FC_SECURE_DATA / FC_PRIVATE_KEY_B64), then reload the entry."
+        )
     client = FcClient(
         email=entry.data[CONF_EMAIL],
         password=entry.data.get(CONF_PASSWORD, ""),
@@ -173,6 +186,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         on_token_refreshed=_on_token_refreshed,
         secure_data=secure_data,
         private_key_b64=private_key_b64,
+        country_code=entry.data.get(CONF_COUNTRY_CODE),
     )
     if entry.data.get("tokens"):
         # Restore persisted tokens (family_id etc.), but the negotiated AES
@@ -183,12 +197,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await client.login()
     except Exception as err:  # noqa: BLE001
-        if not client.tokens:
+        if not client.tokens or not client.has_session:
             raise ConfigEntryNotReady(f"FC SmartHome login failed: {err}") from err
         _LOGGER.warning("FC SmartHome login failed; continuing with cached token: %s", err)
 
     coordinator = FcCoordinator(hass, entry, client)
     await coordinator.async_config_entry_first_refresh()
+
+    # Auto-backfill: when an account is added (first setup) import the
+    # full cloud history so sensors/access-log/statistics are complete
+    # right away instead of requiring a manual import_history call.
+    if not entry.data.get("history_backfilled"):
+        entry.async_on_unload(
+            hass.async_create_task(_async_backfill_history(hass, entry, coordinator))
+        )
 
     # Local-first transport router (LAN -> BLE -> cloud)
     ble_opt = entry.options.get(CONF_LOCAL_BLE)
@@ -284,6 +306,9 @@ async def _setup_local(
     ble_manager = None
     if ble_enabled and endpoints.ble.get("enabled", True):
         ble_manager = FcBleManager(BleConfig.from_registry(endpoints.ble), hass=hass)
+        # restore learned protocol versions (v1/v2 dialect per MAC) so the
+        # very first unlock after a restart uses the right frames
+        await ble_manager.load_versions()
 
     lan_config = LanConfig.from_registry(endpoints.lan)
     router = FcTransportRouter(client, ble_manager=ble_manager, lan_config=lan_config)
@@ -316,12 +341,50 @@ async def _setup_local(
         ble_mac = dev.capabilities.get("bleMac") or dev.capabilities.get("mac")
         if ble_mac:
             router.register_ble(device_id, ble_mac)
+            if router.ble_manager:
+                # VERIFIED from the app bundle: the BLE handshake identity
+                # (lockId) is device.deviceBindUserId, NOT the deviceuuid
+                # ($plugin.openLock(getBleKey(), getBleMac(), device.deviceBindUserId))
+                bind_uid = (
+                    dev.raw.get("deviceBindUserId")
+                    or dev.capabilities.get("deviceBindUserId")
+                )
+                if bind_uid:
+                    router.ble_manager.register_lock_id(ble_mac, bind_uid)
+                else:
+                    router.ble_manager.register_lock_id(ble_mac, device_id)
 
     return router
 
 
 async def _reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def _async_backfill_history(hass: HomeAssistant, entry: ConfigEntry, coordinator) -> None:
+    """One-shot full-history import after account add (marks entry when done)."""
+    from .api.models import parse_ts
+
+    try:
+        for device_id in list(coordinator.devices):
+            events = await coordinator.client.get_history(device_id, limit=0, from_ms=0)
+            for ev in sorted(events, key=lambda e: e.timestamp or parse_ts(1)):
+                coordinator._process_new_events_single(ev)
+            coordinator.prime_from_history(device_id, events)
+            battery_points = _battery_points(events)
+            if battery_points:
+                try:
+                    _import_battery_stats(hass, device_id, battery_points)
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Battery statistics import failed: %s", err)
+        coordinator.async_update_listeners()
+        _LOGGER.info("FC SmartHome history backfill complete")
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("History backfill failed (will retry on next reload): %s", err)
+        return
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "history_backfilled": True}
+    )
 
 
 def _client_for_service(hass: HomeAssistant, device_id: str):
@@ -355,13 +418,10 @@ def _import_battery_stats(hass: HomeAssistant, device_id: str,
                           points: list[tuple[float, int]]) -> int:
     """Import battery readings as external recorder statistics.
 
-    Must run inside the recorder thread via async_add_external_statistics.
     Statistic id: fc_smarthome:<device8>_battery (add a Statistics graph card
     or read via statistics sensor).
     """
     from datetime import datetime, timezone as dt_timezone
-
-    from homeassistant.components.recorder.statistics import import_statistics
 
     statistic_id = f"fc_smarthome:{device_id[:8]}_battery"
     metadata = {
@@ -371,6 +431,9 @@ def _import_battery_stats(hass: HomeAssistant, device_id: str,
         "unit_of_measurement": "%",
         "has_mean": True,
         "has_sum": False,
+        "mean_type": {  # HA >= 2026.4 requires explicit mean type
+            # keep compatible: only set when supported by the running HA
+        }.get("type") or "arithmetic",
     }
     # keep one point per hour boundary (recorder convention), newest last
     by_hour: dict[int, list[int]] = {}
@@ -387,8 +450,13 @@ def _import_battery_stats(hass: HomeAssistant, device_id: str,
     ]
     if not stats:
         return 0
-    import_statistics(hass, metadata, stats)
-    return len(stats)
+    try:
+        from homeassistant.components.recorder.statistics import async_add_external_statistics
+        async_add_external_statistics(hass, metadata, stats)
+        return len(stats)
+    except Exception as err:
+        _LOGGER.warning("Could not record external battery statistics: %s", err)
+        return 0
 
 
 def _register_services(hass: HomeAssistant) -> None:
@@ -414,7 +482,7 @@ def _register_services(hass: HomeAssistant) -> None:
             return {"entries": entries}
 
         hass.services.async_register(
-            DOMAIN, SERVICE_FETCH_HISTORY, _fetch_history, supports_response=True
+            DOMAIN, SERVICE_FETCH_HISTORY, _fetch_history, supports_response=SupportsResponse.OPTIONAL
         )
 
     if not hass.services.has_service(DOMAIN, SERVICE_IMPORT_HISTORY):
@@ -423,7 +491,7 @@ def _register_services(hass: HomeAssistant) -> None:
             """Backfill the lock's cloud history into Home Assistant.
 
             - full access log into the coordinator (last_unlock_* sensors,
-              access-log attributes, event feed)
+               access-log attributes, event feed)
             - battery readings into recorder statistics so the battery
               sensor keeps long-term charts
             - optional per-event HA events for automation backfills
@@ -443,15 +511,18 @@ def _register_services(hass: HomeAssistant) -> None:
                 if coordinator._process_new_events_single(ev):
                     imported += 1
 
+            # derive session state from the fetched window (last unlock,
+            # last bell ring, ring count) and persist battery statistics
+            coordinator.prime_from_history(device_id, events)
+
             # battery statistics backfill (recorder import)
             battery_points = _battery_points(events)
             stats_imported = 0
             if battery_points:
-                from homeassistant.components.recorder import get_instance
-
-                stats_imported = await get_instance(hass).async_add_executor_job(
-                    _import_battery_stats, hass, device_id, battery_points
-                )
+                try:
+                    stats_imported = _import_battery_stats(hass, device_id, battery_points)
+                except Exception as err:
+                    _LOGGER.warning("Battery statistics import failed: %s", err)
 
             coordinator.async_update_listeners()
             return {
@@ -470,7 +541,7 @@ def _register_services(hass: HomeAssistant) -> None:
                     vol.Optional("days", description="Days to import (0 = all)"): vol.Coerce(int),
                 }
             ),
-            supports_response=True,
+            supports_response=SupportsResponse.OPTIONAL,
         )
 
     if not hass.services.has_service(DOMAIN, SERVICE_ADD_USER):
@@ -536,6 +607,150 @@ def _register_services(hass: HomeAssistant) -> None:
             await client.set_child_lock(call.data["device_id"], call.data["enabled"])
 
         hass.services.async_register(DOMAIN, SERVICE_SET_CHILD_LOCK, _child_lock, CHILD_LOCK_SCHEMA)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_BLE_PROBE):
+
+        async def _ble_probe(call: ServiceCall) -> None:
+            """BLE diagnostic: scan -> GATT -> handshake, NO unlock.
+
+            Runs inside HA so the ESPHome Bluetooth proxies are usable.
+            Cycles handshake identity (deviceuuid first) AND frame version
+            (v2 FD first, then v1 FC — the L5 may be a v1-class lock per the
+            app's advertisement classification) with SHORT per-attempt
+            timeouts so the whole battery fits inside the lock's ~60s wake
+            window after a keypad touch.
+            """
+            device_id = call.data["device_id"]
+            _, coordinator = _client_for_service(hass, device_id)
+            router = coordinator.router
+            if not router or not router.ble_manager:
+                raise HomeAssistantError(
+                    "BLE is not enabled for this entry (enable 'local ble' in "
+                    "the integration options)"
+                )
+            dev = coordinator.devices.get(device_id)
+            mac = dev.capabilities.get("bleMac") or dev.capabilities.get("mac") if dev else None
+            if mac:
+                from .local.router import _normalize_mac as _norm
+
+                mac = _norm(mac)
+            raw_uid = (dev.raw.get("uid") if dev else None) or ""
+            # VERIFIED from the app's H5 bundle (chunk-d8ca607a @46450): every
+            # BLE plugin call passes device.deviceBindUserId as the lockId:
+            #   $plugin.openLock(getBleKey(), getBleMac(), m.value.deviceBindUserId, ...)
+            # getBleKey() = bluetoothKey, getBleMac() = uid||mac. The 32-byte
+            # handshake identity is therefore the deviceBindUserId!
+            bind_uid = (
+                (dev.raw.get("deviceBindUserId") if dev else None)
+                or dev.capabilities.get("deviceBindUserId")
+                or ""
+            )
+            identities = [
+                ("deviceBindUserId", bind_uid),
+                ("deviceuuid", device_id),
+                ("uid", raw_uid),
+                ("zeros", "0" * 32),
+            ]
+            identities = [(n, i) for n, i in identities if i]
+            result: dict = {"device_id": device_id, "mac": mac, "attempts": {}}
+            try:
+                from homeassistant.components import bluetooth
+
+                ble_dev = bluetooth.async_ble_device_from_address(
+                    hass, mac, connectable=True
+                ) if mac else None
+                result["seen_by_proxies"] = bool(ble_dev)
+            except Exception as err:  # noqa: BLE001
+                result["seen_by_proxies"] = f"error: {err}"
+
+            last_err: Exception | None = None
+            for name, ident in identities:
+                transport = None
+                try:
+                    # manager.transport() retries the GATT connect itself
+                    transport = await router.ble_manager.transport(mac)
+                    result["attempts"][name] = {"gatt": transport.connected}
+                    info = await transport.handshake(user_id_str=ident, timeout=6.0, attempts=2)
+                    result["attempts"][name]["handshake"] = "OK"
+                    result["attempts"][name].update({
+                        k: v for k, v in info.items() if k != "session_aes_key"
+                    })
+                    result["session_key_acquired"] = bool(transport.session_aes_key)
+                    result["identity_that_worked"] = name
+                    result["protocol_version"] = getattr(transport, "version", "?")
+                    break
+                except Exception as err:  # noqa: BLE001
+                    last_err = err
+                    result["attempts"][name] = {"error": str(err)[:200]}
+                finally:
+                    if transport:
+                        try:
+                            await transport.disconnect()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # the lock needs a moment to release the link between
+                    # consecutive GATT connections (verified live: back-to-back
+                    # connects return empty service tables)
+                    await asyncio.sleep(1.0)
+                    for key in (mac, mac.upper() if mac else None):
+                        if key:
+                            router.ble_manager._transports.pop(key, None)
+            result["final"] = str(last_err)[:200] if last_err and "identity_that_worked" not in result else "success"
+            _LOGGER.info("BLE probe result for %s: %s", device_id, result)
+            for line in (f"{k}: {v}" for k, v in result.items()):
+                _LOGGER.info("  %s", line)
+            hass.async_create_task(
+                hass.services.async_call(
+                    "persistent_notification",
+                    "create",
+                    {
+                        "title": "FC BLE probe",
+                        "message": "\n".join(f"{k}: {v}" for k, v in result.items()),
+                        "notification_id": "fc_ble_probe",
+                    },
+                )
+            )
+
+        hass.services.async_register(DOMAIN, SERVICE_BLE_PROBE, _ble_probe, DEVICE_ID_SCHEMA)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_BLE_UNLOCK):
+
+        async def _ble_unlock(call: ServiceCall) -> None:
+            """BLE unlock via the ESP32 proxies — THE reliable local path."""
+            device_id = call.data["device_id"]
+            _, coordinator = _client_for_service(hass, device_id)
+            router = coordinator.router
+            if not router or not router.ble_manager:
+                raise HomeAssistantError("BLE not enabled for this entry")
+            dev = coordinator.devices.get(device_id)
+            mac = dev.capabilities.get("bleMac") or dev.capabilities.get("mac") if dev else None
+            # the handshake identity is deviceBindUserId (verified from
+            # the app bundle: every $plugin call passes deviceBindUserId)
+            bind_uid = (
+                (dev.raw.get("deviceBindUserId") if dev else None)
+                or (dev.capabilities.get("deviceBindUserId") if dev else None)
+                or device_id
+            )
+            if mac:
+                from .local.router import _normalize_mac as _norm
+
+                mac = _norm(mac)
+                router.ble_manager.register_lock_id(mac, bind_uid)
+            # manager.transport() retries the GATT connect internally
+            transport = await router.ble_manager.transport(mac)
+            try:
+                await transport.handshake(user_id_str=bind_uid)
+                ok = await transport.remote_unlock()
+                if not ok:
+                    raise HomeAssistantError("BLE unlock command rejected by the lock")
+                _LOGGER.info("FC lock %s unlocked via BLE", device_id)
+                # Keep connection alive for reuse; manager will reuse if still connected
+            except Exception:
+                # On error, disconnect to force fresh connection next time
+                await transport.disconnect()
+                raise
+
+        hass.services.async_register(DOMAIN, SERVICE_BLE_UNLOCK, _ble_unlock, DEVICE_ID_SCHEMA)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

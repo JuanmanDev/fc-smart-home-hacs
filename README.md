@@ -7,6 +7,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-red.svg)](https://github.com/hacs/integration)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=JuanmanDev&repository=fc-smart-home-hacs&category=integration)
 
 **Reverse-engineered Home Assistant integration + CLI for FC SmartHome locks**
 (Shenzhen Fingerchip / Fingercrystal — the vendor behind *FC SmartHome*,
@@ -50,6 +51,73 @@ app for everything you'd want from a home-automation hub:
 > the exact REST paths are confirmed live but their per-call shapes still
 > benefit from a quick capture (tools/HARVEST.md). JSON overrides remain
 > supported for drift, plus `fcctl discover` runtime self-configuration.
+
+## How opening the door works
+
+The lock **sleeps** to save battery. While asleep its WiFi/BLE radios only
+listen, so an open command must reach it while it is *awake*. There are two
+channels; the **Bluetooth proxy is optional but strongly recommended** — it
+is the only path that reliably opens the door remotely.
+
+```mermaid
+flowchart TD
+    U[You press Unlock in HA<br/>or an automation fires] --> R{Router: local first}
+
+    R -->|"1 · BLE via ESP32 proxy<br/>(optional but RECOMMENDED)"| BLE[GATT connect through<br/>ESPHome Bluetooth proxy]
+    BLE -->|lock is awake / you touch the keypad| HS[FC BLE handshake<br/>VERIFY_IDENTITY cat2 cmd8<br/>identity = deviceBindUserId<br/>v1 frames 0xFC]
+    HS -->|session AES key| OPEN[OPEN command<br/>cat4 cmd16<br/>door opens ~1s]
+    BLE -->|lock asleep, no answer| WAKE
+
+    R -->|"2 · Cloud over the Internet<br/>(fallback, no proxy needed)"| CLD[POST /v2/lock/openLock<br/>AES-encrypted body]
+    CLD -->|lock's WiFi is awake| OK2[vendor relays the open]
+    CLD -->|lock sleeps → HTTP 682| WAKE[Retry window 60s<br/>+ notification:<br/>'press 4 and # to wake the lock']
+    WAKE -.->|you press 4 + # on the keypad<br/>lock wakes for ~1 min| BLE
+    WAKE -.->|wake window| CLD
+
+    OPEN --> EV[Unlock event lands in<br/>history → event entity, sensors,<br/>access log, who-unlocked]
+    OK2 --> EV
+```
+
+In short:
+
+- **With an ESP32 Bluetooth proxy near the door (recommended):** HA connects
+  to the lock over BLE, does the official handshake and opens the door —
+  even when the lock's WiFi is unreachable. You still need the lock awake
+  (touch the keypad, or press `4` and `#` for the 1-minute wake window) the
+  same way the official app does. A proxy closer to the lock = faster,
+  more reliable connects.
+- **Without a proxy:** HA falls back to the vendor cloud (`openLock`). The
+  vendor backend only relays while the lock's WiFi link is alive; when the
+  lock sleeps it answers HTTP 682, and the integration retries for 60 s and
+  posts a notification telling you to wake the lock (`4` + `#`). Both the
+  **Unlock** and **Open** buttons use this BLE-first + retry flow.
+
+### Wake modes (verified live)
+
+The lock sleeps deep (BLE + WiFi radios idle) and wakes on:
+
+| Wake source | How | Window |
+|---|---|---|
+| Keypad wake mode | press `4` then `#` | ~60 s of full BLE/WiFi activity |
+| Keypad touch / bell | any key press or doorbell ring | a few seconds |
+| Fingerprint / handle | normal use | a few seconds |
+
+During the wake window the integration either completes the BLE handshake
+(proxy path) or the vendor cloud relays `openLock` (WiFi path). If neither
+fires in time, HA shows the guidance notification instead of a cryptic
+error.
+
+### Testing the WiFi-only path (no proxy, no Bluetooth)
+
+```powershell
+python tools\wifi_open_test.py              # 10 s countdown, then openLock + 60 s retries
+python tools\wifi_open_test.py --watch      # fires the instant a wake event lands in history
+python tools\wifi_open_test.py --wait-secs 120 --debug
+```
+
+Run it, press `4` + `#` on the keypad, and the door should open without any
+Bluetooth hardware involved. Exit code 2 (woke but still failed) is a real
+bug — please open an issue with `--debug` output.
 
 ## Install
 
@@ -115,13 +183,19 @@ Entities created per lock (example device *Front Door*):
 ```
 lock.front_door
 sensor.front_door_battery
-sensor.front_door_signal
+sensor.front_door_signal          # BLE RSSI from the proxy advertisements
 sensor.front_door_last_event     # "Dad (finger)" + full access log attributes
+sensor.front_door_last_unlock_user / _method / _time
+sensor.front_door_last_doorbell_ring / _ring_count
+sensor.front_door_last_alarm
+sensor.front_door_firmware_version
+sensor.front_door_bluetooth_mac
 binary_sensor.front_door_door
 binary_sensor.front_door_tamper
 binary_sensor.front_door_door_open_long
 binary_sensor.front_door_motor_error
 binary_sensor.front_door_low_battery
+binary_sensor.front_door_bluetooth_in_range  # lock advertising near a proxy
 binary_sensor.front_door_bell_ringing   # doorbell models: ON while ringing
 switch.front_door_child_lock
 button.front_door_ring_bell
@@ -129,6 +203,17 @@ button.front_door_locate
 button.front_door_sync_now
 event.front_door_events          # trigger-capable event entity
 ```
+
+### Truthful lock state while opening
+
+Opening the door takes a few seconds (BLE connect + handshake + open, or the
+cloud wake window). The lock entity **never fakes the result**: while the
+command runs it keeps its real state and sets
+`action_in_progress: opening` (visible in the entity attributes), and the HA
+UI keeps the button in its loading/pending position until the command
+returns. The state flips to `unlocked` only once the lock has actually
+opened (the coordinator refreshes right after a successful open). If the
+command fails, you get an error toast and the state stays accurate.
 
 Every access is recorded three ways:
 
@@ -242,8 +327,9 @@ Options → *FC SmartHome*:
 | Auth: `token:` header, AES-ECB key, `{"result":1}` envelope, HTTP 672/692 | **extracted from vendor web bundle** (fingercrystal.com/js) |
 | App platform | Alibaba IoT stack: OpenAccount SDK, LinkVisual, SecurityGuard, React Native |
 | LAN CoAP channel | implemented (RFC 7252 codec + Alink RPCs); needs real pk/dn to authenticate — pending cloud/capture |
-| BLE channel | implemented + auto-negotiation; framing is hypothesis pending HCI capture |
+| BLE channel | **verified end-to-end**: v1 FC frames + deviceBindUserId handshake + FC_OPEN command opens the lock; proxy RSSI -97 dBm works |
 | Event pipeline | history-delta polling (works today); WS/MQTT push hooks exist in the registry |
+| Lock entity UX | truthful state + action_in_progress spinner; no optimistic "unlocked" |
 
 The app ships SecNeo-packed with 4 encrypted DEXes inside `assets/0OO00l111l1l`;
 native libs (libsgmain/liblinkvisual/libIVIEWS) confirmed the Alibaba stack.
@@ -293,12 +379,28 @@ tests/test_api.py
 4. **Fail-soft** — one device failing status/history never breaks the whole
    coordinator cycle.
 
-## FAQ
+## FAQ / Troubleshooting
 
 **Remote unlock doesn't work.** Many Fingerchip locks require the cloud bridge
 (gateway) or the app connected via BLE relays; if `fcctl unlock` errors, your
 model may be BLE-only — use `fcctl ble-unlock`. Also run `fcctl probe` to
 confirm endpoints.
+
+**The lock answers HTTP 682.** That is the vendor code for "lock asleep /
+WiFi not connected". Wake it (press `4` and `#`, or ring the bell) and retry;
+the HA integration does this automatically for 60 s and then shows a
+notification. If it never wakes, check the lock's WiFi: blue LED on, device
+still online in the official app, and 2.4 GHz network (these locks do not
+support 5 GHz).
+
+**Open button fails but Unlock works (or vice versa).** Both now run the
+same BLE-first + cloud-retry flow (fixed 2026-09-17: the Open button used to
+skip the wake-retry window). Update to the latest commit and restart HA.
+
+**BLE connect sometimes needs two attempts.** With a weak proxy signal
+(RSSI below ~-90 dBm) the first GATT connect can time out; the integration
+retries automatically. Move the ESP32 proxy closer to the lock for a
+permanent fix.
 
 **Is my data safe?** Credentials stay in your HA config entry (or local token
 file for the CLI). No third-party servers involved; the integration talks only
@@ -307,6 +409,16 @@ to the FC cloud you configure.
 **Legal?** Interoperability reverse engineering for personal use of your own
 hardware. Not affiliated with Shenzhen Fingerchip Intelligent Technology Co.
 Ltd. Use the app captures only on your own devices/accounts.
+
+## 💖 Support this project
+
+If you found this project helpful, please consider supporting it!
+
+[![GitHub Sponsor](https://img.shields.io/badge/Sponsor-JuanmanDev-ea4aaa?style=for-the-badge&logo=github)](https://github.com/sponsors/JuanmanDev) [![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/juanmandev) [![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/juanmandev)
+
+You can also support the project by reporting bugs with `--debug` logs,
+sharing captured endpoints (see [tools/HARVEST.md](tools/HARVEST.md)), or
+giving the repository a star ⭐ if it saved you a Saturday.
 
 ## License
 

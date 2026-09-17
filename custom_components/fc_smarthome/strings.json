@@ -5,7 +5,8 @@
         "title": "FC SmartHome (Fingerchip Smart Lock)",
         "description": "Connect to your FC SmartHome (Fingerchip) account.",
         "data": {
-          "email": "Email",
+          "email": "Email or Phone with Country Code (e.g. +34600112233 or user@example.com)",
+          "country_code": "Phone country code (digits only, e.g. 34)",
           "token": "Session Token (captured from app)",
           "family_id": "Family ID (optional)",
           "password": "Password (optional if Token is provided)",

@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import random
 import struct
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from ..api.const import DEVICE_STATUS_MASKS
@@ -98,6 +100,21 @@ def calc_checksum(pid: int, length: int, payload: bytes) -> int:
     return chk
 
 
+# Golden vendor frame captured inside the app bundle (module 65eb `he()`):
+# the loss-prevention "heart" the app writes with cmd 0x30 cat 0xF0, pid 0xFF.
+GOLDEN_HEART_FRAME = bytes.fromhex(
+    "FDFF1600088AAF3DC1ABE8D57CCBB83CAE35C2AF6BFE"
+)
+
+
+def _normalize(address: str) -> str:
+    """Normalize a MAC to colon format (cloud uses raw hex)."""
+    raw = address.strip().replace(":", "").replace("-", "").upper()
+    if len(raw) == 12:
+        return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+    return address
+
+
 @dataclass
 class FCBleBaseMessage:
     """Inner BLE message structure (matching app module 45cc)."""
@@ -108,34 +125,63 @@ class FCBleBaseMessage:
     pid: int = 0
 
     def encode(self, version: int = 2) -> bytes:
+        """Inner plaintext bytes (module 45cc getBytes(version)).
+
+        v2: len(=9+data, xor byte counted) + index LE32 + cat + cmd + data + xor
+        v1: same layout WITHOUT the trailing xor byte and the length field
+            counts only 8 header bytes + data (getBytes: a=this.length-1,
+            lenArray(a) — so len = data+8, one less than v2).
+        """
         data_len = len(self.data)
-        # v2: length includes the 1-byte data_xor trailer
-        msg_len = data_len + 9 if version == 2 else data_len + 8
-        len_low = msg_len % 256
-        len_high = msg_len // 256
-        
-        # calculate data_xor
-        xor = len_low ^ len_high ^ self.cmd_category ^ self.cmd
+        if version == 2:
+            msg_len = data_len + 9
+            xor = self._data_xor(msg_len)
+            return (
+                struct.pack("<H", msg_len)
+                + struct.pack("<I", self.seq)
+                + bytes([self.cmd_category, self.cmd])
+                + self.data
+                + bytes([xor])
+            )
+        msg_len = data_len + 8  # v1: no xor byte in the count
+        return (
+            struct.pack("<H", msg_len)
+            + struct.pack("<I", self.seq)
+            + bytes([self.cmd_category, self.cmd])
+            + self.data
+        )
+
+    def _data_xor(self, msg_len: int | None = None) -> int:
+        """XOR of lenLo^lenHi^cat^cmd^data (module 45cc makeData_xor)."""
+        n = msg_len if msg_len is not None else len(self.data) + 9
+        xor = (n % 256) ^ (n // 256) ^ self.cmd_category ^ self.cmd
         for b in self.data:
             xor ^= b
-            
-        seq_bytes = struct.pack("<I", self.index if hasattr(self, "index") else self.seq)
-        body = bytes([len_low, len_high]) + seq_bytes + bytes([self.cmd_category, self.cmd]) + self.data
-        if version == 2:
-            body += bytes([xor])
-        return body
+        return xor & 0xFF
 
     @classmethod
     def decode(cls, data: bytes, pid: int = 0, version: int = 2) -> "FCBleBaseMessage | None":
+        """Parse a decrypted inner message (module 45cc fromBytes).
+
+        v2: length counts the xor byte (s=9); data runs to length-1.
+        v1: s=8; data runs to length-8 (to the end of the message).
+        """
         if len(data) < 8:
             return None
         msg_len = data[0] | (data[1] << 8)
-        if len(data) < msg_len:
-            return None
         seq = struct.unpack_from("<I", data, 2)[0]
         cmd_cat = data[6]
         cmd = data[7]
-        payload = data[8:msg_len - (1 if version == 2 else 0)]
+        if version == 2:
+            if len(data) < msg_len or msg_len < 9:
+                return None
+            payload = data[8:msg_len - 1]
+        else:
+            if msg_len < 8:
+                return None
+            # v1: len counts header+data only (no xor); the AES NoPadding
+            # zero-fill must be stripped via the length field
+            payload = data[8:msg_len]
         return cls(cmd_category=cmd_cat, cmd=cmd, data=payload, seq=seq, pid=pid)
 
 
@@ -145,20 +191,25 @@ def build_fc_package(
     pid: int = 0,
     version: int = 2,
 ) -> bytes:
-    """Build a complete FCBlePackage frame (matching app module 4048)."""
+    """Build a complete FCBlePackage frame (matching app module 4048).
+
+    v2: start 0xFD, end 0xFE. v1: start 0xFC, end 0xFC (module 4048: i=253/c=254
+    for version 2 else l=252/d=254 — the v1 END byte is 254 too; the frame
+    differs only in start and inner layout).
+    """
     start_byte = 0xFD if version == 2 else 0xFC
     end_byte = 0xFE
-    
+
     if isinstance(message, FCBleBaseMessage):
         raw_msg = message.encode(version=version)
         pid = message.pid
     else:
         raw_msg = message
-        
+
     enc_payload = ble_encrypt(raw_msg, key_hex)
     total_len = 6 + len(enc_payload)
     chk = calc_checksum(pid, total_len, enc_payload)
-    
+
     return bytes([
         start_byte,
         pid,
@@ -167,13 +218,23 @@ def build_fc_package(
     ]) + enc_payload + bytes([chk, end_byte])
 
 
-def parse_fc_package(frame: bytes, key_hex: str = DEFAULT_AES_KEY, version: int = 2) -> FCBleBaseMessage | None:
-    """Parse and decrypt an incoming FCBlePackage (matching app module 4048)."""
+def parse_fc_package(
+    frame: bytes,
+    key_hex: str = DEFAULT_AES_KEY,
+    version: int | None = None,
+) -> FCBleBaseMessage | None:
+    """Parse and decrypt an incoming FCBlePackage (matching app module 4048).
+
+    Auto-detects protocol version from the start byte when not given
+    (0xFD = v2, 0xFC = v1).
+    """
     if len(frame) < 8:
         return None
     start = frame[0]
     if start not in (0xFC, 0xFD) or frame[-1] != 0xFE:
         return None
+    if version is None:
+        version = 2 if start == 0xFD else 1
     pid = frame[1]
     total_len = frame[2] | (frame[3] << 8)
     if len(frame) != total_len:
@@ -272,15 +333,33 @@ class FcBleTransport:
         self._pending_fc: dict[tuple[int, int], asyncio.Future] = {}
         self._rx_buffer = bytearray()
         self._rx_expected_len = 0
-        self._seq = 1
+        self._seq = 1  # first message of a connection uses index 1 (app convention)
+        # protocol version: 1 = FC frames (default — the L5-WIFI-QINGKE and
+        # older FC locks speak v1), 2 = FD frames. The manager pins the
+        # LEARNED version per MAC (persisted across restarts) so every
+        # connection starts with the right dialect immediately.
+        self.version = 1
+        # callback(manager) invoked when a frame is parsed, so the manager
+        # can persist the learned protocol version
+        self.on_frame_parsed: Callable[[int], None] | None = None
         self.session_aes_key: str | None = None
         self.device_info: dict[str, Any] = {}
         self._event_callbacks: list[Callable[[dict], None]] = []
         self._status: LockStatus | None = None
+        # cloud lock id (deviceuuid) for the handshake identity payload
+        self.lock_id: str | None = None
+        self._last_activity = 0.0
 
     def _next_seq(self) -> int:
-        self._seq = (self._seq + 1) & 0xFFFFFF
-        return self._seq
+        """App convention (module 65eb): se starts at 1 per connection and
+        each subsequent message uses CURRENT index then increments; after a
+        response the lock's index+1 becomes the next expected. _transact_fc
+        keeps self._seq synced from responses; after the handshake it is
+        already response.index+1 (full u32 — the lock echoes a timestamp).
+        """
+        current = self._seq
+        self._seq = (self._seq + 1) & 0xFFFFFFFF
+        return current
 
     # ---------- lifecycle ----------
 
@@ -307,11 +386,14 @@ class FcBleTransport:
                         pass
                 return self.device
 
+            # Single attempt with tight timeout: the manager retries 3x with 8s cap.
+            # bleak's internal default is 20s; 8s cap cuts worst-case per-try from 20s to 8s.
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 self.device,
                 name=self.device.name or self.device.address,
-                max_attempts=2,
+                max_attempts=1,
+                timeout=8.0,
                 use_services_cache=True,
                 ble_device_callback=_get_device,
             )
@@ -325,10 +407,29 @@ class FcBleTransport:
     async def _negotiate_characteristics(self) -> None:
         """Learn write/notify characteristics from the device (no static map).
 
-        Preference: (a) the configured UUIDs if present, (b) else pick the
-        first write + notify characteristics found on any service.
+        The L5 exposes an EMPTY/partial GATT table while deep asleep (verified
+        live 2026-09-13): on connect it serves a minimal table without FFE1.
+        If the first discovery has no notifiable char, re-run service
+        discovery a few times before giving up — the table appears once the
+        lock's radio is fully up (or when it is awake).
         """
-        services = self._client.services
+        have_notify = False
+        services = None
+        for attempt in range(3):
+            services = self._client.services
+            if services is None:
+                await asyncio.sleep(0.5)
+                continue
+            have_notify = any(
+                "notify" in c.properties for s in services for c in s.characteristics
+            )
+            if have_notify:
+                break
+            _LOGGER.debug(
+                "GATT table has no notifiable char yet (attempt %d); "
+                "re-running service discovery", attempt + 1
+            )
+            await asyncio.sleep(0.75)
         if services is None:
             return
         write_uuid = self.config.write_characteristic
@@ -347,6 +448,18 @@ class FcBleTransport:
                         have_notify = True
         self.config.write_characteristic = write_uuid
         self.config.notify_characteristic = notify_uuid
+        # dump the GATT table for diagnosis (deep-asleep L5 serves a minimal
+        # table; awake it serves FFE0/FFE1)
+        try:
+            table = [
+                f"{s.uuid}: " + ", ".join(
+                    f"{c.uuid}[{','.join(c.properties)}]" for c in s.characteristics
+                )
+                for s in services
+            ]
+            _LOGGER.debug("GATT table: %s", " | ".join(table) or "EMPTY")
+        except Exception:  # noqa: BLE001
+            pass
         if have_notify:
             char = await self._find_notify_characteristic()
             if char is None:
@@ -367,6 +480,14 @@ class FcBleTransport:
                 f"No notifiable characteristic found on {self.device.address}; "
                 "cannot receive FC responses"
             )
+        # NOTE: no wake-prime "heart" frame here. The app only writes the
+        # golden heart (module 65eb he()) on an ALREADY-ESTABLISHED session
+        # (loss-prevention mode) or when a message queue empties — never as
+        # the first write after a fresh GATT connect. On a fresh connection
+        # the first frame the lock expects is the handshake (index 1), and
+        # writing the heart first (index 2!) desynchronizes the lock's
+        # expected index. Removed after re-reading module 65eb/55c3.
+        await asyncio.sleep(0.15)  # CCCD settle beat (app: notify->connect cb)
 
     async def _find_notify_characteristic(self):
         services = self._client.services
@@ -396,6 +517,7 @@ class FcBleTransport:
 
     def _on_notify(self, _char, data: bytearray) -> None:
         raw = bytes(data)
+        _LOGGER.debug("FC BLE <- %s (%d bytes)", raw.hex(), len(raw))
         if raw.startswith(MAGIC):
             frame = parse_frame(raw)
             if frame is None:
@@ -422,13 +544,30 @@ class FcBleTransport:
         else:
             self._rx_buffer.extend(raw)
 
-        if self._rx_buffer and len(self._rx_buffer) >= self._rx_expected_len and self._rx_buffer[-1] == 0xFE:
-            complete = bytes(self._rx_buffer)
+        if (
+            self._rx_buffer
+            and self._rx_expected_len
+            and len(self._rx_buffer) >= self._rx_expected_len
+        ):
+            complete = bytes(self._rx_buffer[: self._rx_expected_len])
             self._rx_buffer = bytearray()
             self._rx_expected_len = 0
             key = self.session_aes_key or self.config.aes_key
             parsed = parse_fc_package(complete, key_hex=key)
+            _LOGGER.debug("FC BLE frame parsed: %s",
+                          f"cat=0x{parsed.cmd_category:02x} cmd=0x{parsed.cmd:02x} "
+                          f"seq={parsed.seq}" if parsed else "FAILED")
             if parsed:
+                # learn the protocol version from what the lock itself sends
+                if complete[0] == 0xFC:
+                    self.version = 1
+                else:
+                    self.version = 2
+                if self.on_frame_parsed is not None:
+                    try:
+                        self.on_frame_parsed(self.version)
+                    except Exception:  # noqa: BLE001
+                        pass
                 key_tuple = (parsed.cmd_category, parsed.cmd)
                 fut = self._pending_fc.pop(key_tuple, None)
                 if fut and not fut.done():
@@ -441,9 +580,31 @@ class FcBleTransport:
                                 f.set_result(parsed)
                                 break
 
+    async def _write_frame(self, frame: bytes) -> None:
+        """Write a full frame in <=20B write-commands with pacing.
+
+        The ESP32 proxies relay write-commands with no ATT flow control;
+        blasting all chunks back-to-back can overflow the proxy/lock radio
+        buffers (verified: silent loss at rssi -97). The phone app also
+        paces its writes. 15-25ms between chunks is enough.
+        """
+        for i in range(0, len(frame), 20):
+            await self._client.write_gatt_char(
+                self.config.write_characteristic, frame[i:i + 20], response=False
+            )
+            if i + 20 < len(frame):
+                await asyncio.sleep(0.02)
+
     async def _transact_fc(
         self, message: FCBleBaseMessage, timeout: float | None = None
     ) -> FCBleBaseMessage:
+        """Send a message and wait for its response, RESENDING like the app.
+
+        The app (module 55c3 Te/Ie) re-sends the SAME frame every resendTime
+        (10s default) up to K=10 times while waiting. We resend every 5s
+        within the timeout window. On success the app sets the NEXT index to
+        response.index+1 (module 65eb: se=e.index+1) — we mirror that.
+        """
         async with self._lock:
             if not self.connected:
                 await self.connect()
@@ -452,22 +613,51 @@ class FcBleTransport:
             key = (message.cmd_category, message.cmd)
             self._pending_fc[key] = fut
             key_hex = self.session_aes_key or self.config.aes_key
-            frame = build_fc_package(message, key_hex=key_hex, pid=message.pid, version=2)
+            version = getattr(self, "version", 2)
+            frame = build_fc_package(message, key_hex=key_hex, pid=message.pid, version=version)
+            _LOGGER.debug("FC BLE -> %s (cat=0x%02x cmd=0x%02x seq=%s key=%s... v%d)",
+                          frame.hex(), message.cmd_category, message.cmd,
+                          getattr(message, "seq", "?"), key_hex[:8], version)
+            total = timeout or self.config.command_timeout
             try:
-                try:
-                    await self._client.write_gatt_char(
-                        self.config.write_characteristic, frame, response=True
-                    )
-                except Exception as write_err:  # noqa: BLE001
-                    # some FC locks only accept Write Commands (no response)
-                    _LOGGER.debug(
-                        "BLE write with response failed (%s); retrying as write command",
-                        write_err,
-                    )
-                    await self._client.write_gatt_char(
-                        self.config.write_characteristic, frame, response=False
-                    )
-                return await asyncio.wait_for(fut, timeout or self.config.command_timeout)
+                deadline = loop.time() + total
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        await self._write_frame(frame)
+                    except Exception as err:  # noqa: BLE001
+                        if attempt >= 3:
+                            raise FcLocalError(f"BLE FC write failed: {err}") from err
+                        # stale/dead link: reconnect once and resend the
+                        # SAME frame (the lock never saw it)
+                        _LOGGER.debug("write failed (%s); reconnecting "
+                                      "before resend", err)
+                        await self.disconnect()
+                        await self.connect()
+                        continue
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    try:
+                        resp = await asyncio.wait_for(
+                            asyncio.shield(fut), min(remaining, 5.0)
+                        )
+                        # app convention (module 65eb): next index = the
+                        # index the LOCK used in its response, +1 (full
+                        # u32 — the lock echoes a timestamp-like counter)
+                        try:
+                            self._seq = (int(resp.seq) + 1) & 0xFFFFFFFF
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return resp
+                    except asyncio.TimeoutError:
+                        if loop.time() >= deadline or fut.done():
+                            if fut.done():
+                                return fut.result()
+                            raise asyncio.TimeoutError()
+                        _LOGGER.debug("no response in 5s; resending frame "
+                                      "(attempt %d)", attempt + 1)
             except asyncio.TimeoutError as err:
                 self._pending_fc.pop(key, None)
                 raise FcLocalError(
@@ -476,15 +666,35 @@ class FcBleTransport:
             except Exception as err:
                 self._pending_fc.pop(key, None)
                 raise FcLocalError(f"BLE FC write failed: {err}") from err
+            finally:
+                self._pending_fc.pop(key, None)
 
     async def handshake(
         self,
         user_id: str = "00000000000000000000000000000000",
         timeout: float = 10.0,
         user_id_str: str | None = None,
+        attempts: int = 3,
     ) -> dict[str, Any]:
-        """Perform official FC BLE handshake to verify identity and get session AES key."""
-        effective_uid = user_id_str if user_id_str is not None else user_id
+        """Perform official FC BLE handshake (VERIFY_IDENTITY, cat 2 cmd 8).
+
+        Identity: the 32-byte payload is the CLOUD LOCK ID (deviceuuid),
+        verified against the app's FCBleShakeHandleMessage (module 87e7):
+        lockId padded to 32 ASCII bytes + 7 time bytes (year-2000, month,
+        day, hour, minute, second, -getTimezoneOffset()/60). Response:
+        result byte + session AES key(16) + MAC(12) + protocolVersion(3) +
+        model(8) + firmware(15) + wakeSource(2) + fingerprintVersion(15).
+
+        The bound ``self.lock_id`` (registered from the cloud deviceuuid)
+        WINS over any caller-provided identity — the router used to pass
+        zeros here, which the lock silently ignored.
+        """
+        # priority: explicit arg > bound lock_id > default zeros
+        effective_uid = user_id_str if user_id_str is not None else (
+            self.lock_id if self.lock_id else user_id
+        )
+        _LOGGER.debug("BLE handshake identity: %s (lock_id=%s arg=%s)",
+                      effective_uid, self.lock_id, user_id_str if user_id_str is not None else user_id)
         import datetime
         now = datetime.datetime.now().astimezone()
         tz_offset = 2
@@ -492,6 +702,10 @@ class FcBleTransport:
             tz_offset = -int(now.utcoffset().total_seconds() / 3600) if now.utcoffset() else 0
         except Exception:
             pass
+        # NOTE: the app uses JS Date on the PHONE (local time of the lock's
+        # owner); the tz byte is -getTimezoneOffset()/60 = positive for UTC+N
+        # in Spain (UTC+2 summer). We match the app convention.
+        tz_byte = -tz_offset if tz_offset < 0 else abs(tz_offset)
         date_bytes = bytes([
             now.year - 2000,
             now.month,
@@ -499,20 +713,50 @@ class FcBleTransport:
             now.hour,
             now.minute,
             now.second,
-            tz_offset & 0xFF,
+            tz_byte & 0xFF,
         ])
         user_bytes = effective_uid.encode("ascii")[:32].ljust(32, b"\x00")
         payload = user_bytes + date_bytes
-        msg = FCBleBaseMessage(
-            cmd_category=CATEGORY_SYSTEM,
-            cmd=CMD_SYSTEM_VERIFY_IDENTITY,
-            data=payload,
-            seq=self._next_seq(),
-        )
-        resp = await self._transact_fc(msg, timeout=timeout)
+        # App convention: the handshake is ALWAYS index 1 (the first
+        # message of a connection); seq only advances AFTER a success.
+        # A failed attempt means the link is stale — reconnect fresh and
+        # send index 1 again (module 65eb: se is reset per connection).
+        resp = None
+        last_err: Exception | None = None
+        # Version strategy: v1-first (L5 is v1). If version already known,
+        # try that first; otherwise try v1 then v2. Short timeouts avoid
+        # burning the ~60s wake window on wrong-dialect retries.
+        if self.version in (1, 2):
+            cycle: list[int] = [self.version, 3 - self.version]
+        else:
+            cycle = [1, 2]
+        # v1 typically responds in <500ms; 2s is generous. v2 gets 3s.
+        timeouts = [2.0, 3.0]
+        for slot, version in enumerate(cycle):
+            msg = FCBleBaseMessage(
+                cmd_category=CATEGORY_SYSTEM,
+                cmd=CMD_SYSTEM_VERIFY_IDENTITY,
+                data=payload,
+                seq=1,
+            )
+            self.version = version
+            try:
+                resp = await self._transact_fc(msg, timeout=timeouts[slot])
+                break
+            except FcLocalError as err:
+                last_err = err
+                _LOGGER.debug("handshake slot %d (v%d) failed: %s",
+                              slot + 1, version, err)
+                # dead/stale link: force a fresh GATT connection for the
+                # next attempt (the old client's characteristic handles
+                # are gone — verified live: "FFE1 was not found")
+                await self.disconnect()
+                await asyncio.sleep(0.2)
+        if resp is None:
+            raise FcLocalError(f"BLE handshake failed after {attempts} attempts: {last_err}")
         if not resp or len(resp.data) < 1:
             raise FcLocalError("BLE handshake failed: empty response")
-        if resp.data[0] != 0:
+        if resp.data[0] not in (0, 241):
             raise FcLocalError(f"BLE handshake rejected with status: {resp.data[0]}")
         info: dict[str, Any] = {"status": resp.data[0]}
         if len(resp.data) >= 17:
@@ -762,6 +1006,81 @@ class FcBleManager:
         self._transports: dict[str, FcBleTransport] = {}
         self._discovered: dict[str, "BLEDevice"] = {}
         self._lock = asyncio.Lock()
+        # cloud lock id per BLE address — needed for the handshake identity
+        self.lock_ids: dict[str, str] = {}
+        # learned protocol version per MAC (1 = FC frames, 2 = FD frames).
+        # Classified from the advertisement exactly like the app
+        # (module 55c3 be(): >=40 hex adv chars => v2, exactly 34 => v1)
+        self.versions: dict[str, int] = {}
+        # persistence of learned versions across HA restarts (tiny JSON in
+        # the config dir; written only when a version CHANGES)
+        self._versions_file: str | None = None
+        if hass is not None:
+            try:
+                self._versions_file = str(
+                    Path(hass.config.config_dir) / ".fc_ble_learned.json"
+                )
+            except Exception:  # noqa: BLE001
+                self._versions_file = None
+
+    def _read_versions_file(self) -> None:
+        """Seed learned versions from the persisted file (blocking I/O)."""
+        if not self._versions_file:
+            return
+        try:
+            data = json.loads(Path(self._versions_file).read_text(encoding="utf-8"))
+            for mac, version in (data.get("versions") or {}).items():
+                if version in (1, 2):
+                    self.versions[mac] = version
+                    self.versions[mac.upper()] = version
+        except FileNotFoundError:
+            pass
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("could not load learned BLE versions: %s", err)
+
+    async def load_versions(self) -> None:
+        """Seed learned versions from the persisted file (setup time)."""
+        if not self._versions_file:
+            return
+        if self.hass is not None:
+            await self.hass.async_add_executor_job(self._read_versions_file)
+        else:
+            self._read_versions_file()
+
+    def register_version(self, address: str, version: int) -> None:
+        """Record the protocol version for a MAC (learned/persisted)."""
+        if version not in (1, 2):
+            return
+        mac = _normalize(address)
+        changed = self.versions.get(mac) != version
+        self.versions[mac] = version
+        self.versions[mac.upper()] = version
+        if changed:
+            self._persist_versions()
+
+    def _persist_versions(self) -> None:
+        """Write learned versions to disk (best effort, off the loop)."""
+        if not self._versions_file or self.hass is None:
+            return
+        snapshot = {
+            mac: v for mac, v in self.versions.items() if mac == mac.upper()
+        }
+        try:
+            self.hass.async_add_executor_job(self._write_versions_file, snapshot)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _write_versions_file(self, snapshot: dict) -> None:
+        try:
+            Path(self._versions_file).write_text(
+                json.dumps({"versions": snapshot}, indent=1), encoding="utf-8"
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("could not persist learned BLE versions: %s", err)
+
+    def register_lock_id(self, address: str, lock_id: str) -> None:
+        """Associate a BLE address with its cloud lock id (deviceuuid)."""
+        self.lock_ids[_normalize(address)] = lock_id
 
     def register_discovered_device(self, address: str, device: "BLEDevice") -> None:
         """Register a BLEDevice provided by Home Assistant bluetooth scanner."""
@@ -823,12 +1142,24 @@ class FcBleManager:
             try:
                 from homeassistant.components import bluetooth
 
-                fresh = bluetooth.async_ble_device_from_address(self.hass, addr_clean, connectable=True)
-                if fresh is None:
-                    fresh = bluetooth.async_ble_device_from_address(self.hass, address, connectable=True)
-                if fresh:
-                    dev = fresh
-                    self.register_discovered_device(address, dev)
+                # connectable lookup needs the scanner in ACTIVE mode;
+                # try both address forms and both connectable classes
+                for addr in (address, addr_clean):
+                    fresh = bluetooth.async_ble_device_from_address(
+                        self.hass, addr, connectable=True
+                    )
+                    if fresh is None:
+                        fresh = bluetooth.async_ble_device_from_address(
+                            self.hass, addr, connectable=False
+                        )
+                    if fresh:
+                        dev = fresh
+                        self.register_discovered_device(address, dev)
+                        _LOGGER.debug(
+                            "HA bluetooth provided %s (connectable=%s) for %s",
+                            fresh, fresh.details.get("connectable"), address,
+                        )
+                        break
             except Exception as err:
                 _LOGGER.debug("Could not get connectable BLEDevice from HA bluetooth: %s", err)
 
@@ -866,8 +1197,46 @@ class FcBleManager:
             raise FcLocalError(
                 f"BLE device {address} not found (verify ESPHome Bluetooth proxy or Bluetooth hardware)"
             )
-        transport = FcBleTransport(dev, self.config, hass=self.hass)
-        await transport.connect()
+        # the -97dBm ESP32 proxies fail GATT connects often; retry HERE so
+        # every caller (router/lock entity, services, coordinator sync)
+        # gets resilient connects without duplicating retry loops
+        transport: FcBleTransport | None = None
+        last_conn_err: Exception | None = None
+        for conn_try in range(3):
+            transport = FcBleTransport(dev, self.config, hass=self.hass)
+            # protocol version: use the LEARNED version (from a previous
+            # lock response, persisted across restarts) — avoids burning
+            # the lock's short wake window on the wrong frame dialect.
+            learned = self.versions.get(addr_clean) or self.versions.get(address)
+            if learned in (1, 2):
+                transport.version = learned
+            # persist the version the lock itself speaks when it answers
+            transport.on_frame_parsed = (
+                lambda v, a=addr_clean: self.register_version(a, v)
+            )
+            try:
+                await transport.connect()
+                last_conn_err = None
+                break
+            except FcLocalError as err:
+                last_conn_err = err
+                _LOGGER.debug(
+                    "GATT connect try %d/%d failed for %s: %s",
+                    conn_try + 1, 3, address, err,
+                )
+                with contextlib.suppress(Exception):
+                    await transport.disconnect()
+                transport = None
+                if conn_try < 2:
+                    await asyncio.sleep(0.75)
+        if transport is None:
+            raise FcLocalError(
+                f"BLE connect failed after retries: {last_conn_err}"
+            )
+        # bind the cloud lock id for the handshake identity if known
+        lock_id = self.lock_ids.get(addr_clean) or self.lock_ids.get(address)
+        if lock_id:
+            transport.lock_id = lock_id
         async with self._lock:
             self._transports[addr_clean] = transport
             self._transports[address] = transport

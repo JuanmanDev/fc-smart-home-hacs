@@ -11,6 +11,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Callable
 
 import aiohttp
@@ -46,6 +48,16 @@ REQUEST_TIMEOUT = 15
 RATE_LIMIT_STATUS = 672  # vendor-specific: too many requests, retry in 3 min
 TOKEN_EXPIRED_STATUS = 690  # vendor-specific: token expired -> re-login
 RESULT_OK = 1
+# The lock re-locks itself this many seconds after an unlock (auto-relock
+# model, verified live 2026-09-11). Cloud lockState sticks at "unlocked"
+# after the last event, so we only report unlocked inside this window.
+RELOCK_WINDOW_SECONDS = 15
+
+
+def _now_utc():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
 
 # Verified messageKey -> (LockEventType, UnlockMethod|None) mapping from live
 # /v2/lock/getLockMessageList/v2 captures (2026-09-09).
@@ -63,6 +75,40 @@ MESSAGE_KEY_MAP = {
 }
 
 
+def _find_protocol_secret(kind: str) -> str | None:
+    """Load a protocol secret (secure_data / private_key) from env or disk."""
+    env_map = {"secure_data": "FC_SECURE_DATA", "private_key": "FC_PRIVATE_KEY_B64"}
+    if os.environ.get(env_map.get(kind, "")):
+        return os.environ[env_map[kind]]
+
+    names = {
+        "secure_data": ("fc_secure_data.json", "secure_data"),
+        "private_key": ("fc_app_privkey.b64", None),
+    }
+    if kind not in names:
+        return None
+    fname, json_key = names[kind]
+    candidates = [
+        Path.cwd() / ".secrets" / fname,
+        Path(__file__).resolve().parents[3] / ".secrets" / fname,
+        Path.home() / ".fcsmarthome" / fname,
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                if json_key:
+                    data = json.loads(cand.read_text(encoding="utf-8"))
+                    if data.get(json_key):
+                        return data[json_key]
+                else:
+                    value = cand.read_text(encoding="utf-8").strip()
+                    if value:
+                        return value
+            except (OSError, ValueError):
+                continue
+    return None
+
+
 class FcClient:
     """Cloud client speaking the FC SmartHome encrypted protocol."""
 
@@ -76,11 +122,13 @@ class FcClient:
         on_token_refreshed: Callable[[TokenPair], None] | None = None,
         secure_data: str | None = None,
         private_key_b64: str | None = None,
+        country_code: str | int | None = None,
     ) -> None:
         # The vendor login is phone-based; "email" holds the account name
         # (phone number in E.164 or national format).
         self.email = email
         self._password = password
+        self.country_code = str(country_code or os.environ.get("FC_CC", "34"))
         self.endpoints = endpoints or EndpointRegistry.load(region)
         self.endpoints.region = region
         self._session = session
@@ -90,8 +138,8 @@ class FcClient:
         self._user_cache: dict[str, dict[str, LockUser]] = {}
         self._last_events: dict[str, list[LockEvent]] = {}
         # protocol artifacts
-        self._secure_data = secure_data  # 'secureData=<urlencoded b64>'
-        self._private_key_b64 = private_key_b64
+        self._secure_data = secure_data or _find_protocol_secret("secure_data")  # 'secureData=<urlencoded b64>'
+        self._private_key_b64 = private_key_b64 or _find_protocol_secret("private_key")
         self._session_key: bytes | None = None  # negotiated AES key
         self._cookie_session: str | None = None  # SESSION cookie value (b64)
 
@@ -320,9 +368,9 @@ class FcClient:
         else:
             # verified flow: phone + countrycode
             phone = self.email.lstrip("+")
-            cc = "34"
-            if phone.startswith("34") and len(phone) > 9:
-                phone = phone[2:]
+            cc = self.country_code
+            if phone.startswith(cc) and len(phone) > len(cc) + 6:
+                phone = phone[len(cc):]
             payload["phone"] = phone
             payload["countrycode"] = int(cc)
             path = "login"
@@ -474,7 +522,8 @@ class FcClient:
         for k in (
             "bluetoothKey", "secretKey", "dynamicKey", "bleMac", "mac", "macType",
             "firmwareversion", "protocolversion", "functions", "lockState",
-            "doorState", "lowbattery", "battery",
+            "doorState", "lowbattery", "battery", "deviceBindUserId", "uid",
+            "endpoint", "shortaddress",
         ):
             if item.get(k) is not None:
                 capabilities[k] = item[k]
@@ -485,22 +534,64 @@ class FcClient:
         if not dev:
             return LockStatus(device_id=device_id)
         raw = dev.raw
+        locked: bool | None
+        if raw.get("lockState") is None:
+            locked = None
+        elif raw.get("lockState") == 1:
+            locked = True
+        else:
+            # Auto-relock model (verified live): the cloud lockState sticks
+            # at 0 ("unlocked") after the last unlock event forever — the
+            # bolt physically re-locks itself within seconds but the lock
+            # never reports a relock message. Treat "unlocked" as true only
+            # within a short window after the newest unlock event we know.
+            locked = True
+            for ev in self._last_events.get(device_id, []):
+                if ev.type is LockEventType.UNLOCKED and ev.timestamp:
+                    age = (_now_utc() - ev.timestamp).total_seconds()
+                    if 0 <= age < RELOCK_WINDOW_SECONDS:
+                        locked = False
+                    break  # events sorted newest-first
+
+        def raw_flag(name: str) -> bool | None:
+            value = raw.get(name)
+            if value is None:
+                return None
+            return bool(value)
+
+        # low-battery: the threshold lives in deviceCategory.lowbattery
+        # (e.g. 10 = warn below 10%); the top-level payload has no flag
+        category = raw.get("deviceCategory") or {}
+        low_threshold = category.get("lowbattery")
+        battery_val = raw.get("battery")
+        low_battery: bool | None = None
+        if isinstance(low_threshold, int) and isinstance(battery_val, int):
+            low_battery = battery_val <= low_threshold
+
         status = LockStatus(
             device_id=device_id,
-            locked=(raw.get("lockState") == 1) if raw.get("lockState") is not None else None,
-            door_open=bool(raw.get("doorState")) if raw.get("doorState") is not None else None,
+            locked=locked,
+            door_open=raw_flag("doorState"),
             battery=raw.get("battery"),
             online=True,
+            # alarm/status flags from the verified device payload
+            door_open_long=raw_flag("alarmLockNotClosed"),
+            tamper=raw_flag("illegaloperation") or raw_flag("alarmIllegaloperation"),
+            child_lock=raw_flag("childLock"),
+            low_battery=low_battery,
             raw=raw,
         )
-        if raw.get("alarmLockNotClosed"):
-            status.door_open_long = bool(raw.get("alarmLockNotClosed"))
         return status
 
     # ---------- lock control ----------
 
     async def unlock(self, device_id: str, reason: str = "app") -> ControlResult:
         # remote unlock flow (from app): validate security password then open
+        # Known limitation (verified live 2026-09-11): /v2/lock/openLock
+        # returns HTTP 500/682 "null" whenever the WiFi lock is asleep /
+        # not connected to the vendor cloud — this is server-side; the
+        # app shows the same failure. Retry logic for awake windows is in
+        # the HA layer (lock.py) and tools/unlock_awake_window.py.
         body = await self._post("remote_unlock", {
             "id": device_id,
             "token": self.tokens.access_token,
@@ -510,19 +601,41 @@ class FcClient:
         return ControlResult(success=True, message=str(data.get("message") or "ok"), raw=data)
 
     async def lock(self, device_id: str) -> ControlResult:
-        return await self.unlock(device_id)
+        """There is no cloud 'lock' command in the verified protocol.
+
+        ``/v2/lock/openLock`` only OPENS the lock. These models re-lock
+        themselves a few seconds after each unlock, so sending openLock
+        here (as the old code did) would physically OPEN a door when the
+        user asks HA to lock it. Real locking, if ever needed, must come
+        from the LAN/BLE channels; the cloud path is a safe no-op.
+        """
+        return ControlResult(
+            success=True,
+            message="auto-relock model: the lock re-locks itself after each unlock",
+        )
 
     async def latch(self, device_id: str) -> ControlResult:
         return await self.unlock(device_id)
 
     async def ring_bell(self, device_id: str) -> ControlResult:
-        body = await self._post("bell", {
-            "id": device_id,
-            "token": self.tokens.access_token,
-            "timestamp": now_ms(),
-        })
-        data = self._unwrap(body)
-        return ControlResult(success=True, message="bell rung", raw=data)
+        """Ring the doorbell / find the device.
+
+        No bell-ringing endpoint is verified in the vendor protocol; the
+        ``bell`` path is the doorbell-volume *setting*. Best effort: try
+        the configured endpoint, never raise into the HA UI.
+        """
+        try:
+            body = await self._post("bell", {
+                "id": device_id,
+                "token": self.tokens.access_token,
+                "timestamp": now_ms(),
+            })
+        except FcError as err:
+            return ControlResult(
+                success=False,
+                message=f"Remote bell is not supported by the FC cloud protocol ({err})",
+            )
+        return ControlResult(success=True, message="bell rung", raw=self._unwrap(body))
 
     async def beep(self, device_id: str) -> ControlResult:
         return await self.ring_bell(device_id)
@@ -564,6 +677,9 @@ class FcClient:
                 if user:
                     users.append(user)
         self._user_cache[device_id] = {u.user_id: u for u in users}
+        # keep name-based lookup for events whose user_id is a message id
+        self._user_cache_by_name = getattr(self, "_user_cache_by_name", {})
+        self._user_cache_by_name[device_id] = {u.name: u for u in users}
         return users
 
     def _parse_user(self, item: dict) -> LockUser | None:
@@ -590,7 +706,10 @@ class FcClient:
         self, device_id: str, limit: int = 50, offset: int = 0, from_ms: int | None = None
     ) -> list[LockEvent]:
         if from_ms is None:
-            from_ms = now_ms() - 86_400_000
+            # full history from time zero: the vendor API returns nothing for
+            # narrow recent windows (verified live 2026-09-10) and the event
+            # pipeline dedups, so fetch broadly and slice locally
+            from_ms = 0
         body = await self._post("logs", {
             "fromTime": from_ms,
             "deviceId": device_id,
@@ -599,10 +718,50 @@ class FcClient:
             "timestamp": now_ms(),
         })
         events = self._parse_events(device_id, body)
+        self._enrich_event_methods(device_id, events)
         if limit:
             events = events[:limit]
         self._last_events[device_id] = events
         return events
+
+    async def _ensure_user_cache(self, device_id: str) -> None:
+        """Populate the user cache (id -> LockUser) once per device."""
+        if device_id in self._user_cache:
+            return
+        try:
+            await self.get_users(device_id)
+        except FcError:
+            self._user_cache[device_id] = {}
+
+    def _enrich_event_methods(self, device_id: str, events: list[LockEvent]) -> None:
+        """Resolve UnlockMethod.UNKNOWN events using the lock user list.
+
+        The cloud history reports only the credential OWNER; the lock user
+        list (getLockUserList) says which credential TYPE each owner has
+        (1=finger, 2=password, 3=card). Cross-referencing user ids gives
+        the real unlock method for most events.
+        """
+        cache = self._user_cache.get(device_id)
+        if not cache:
+            return  # cache not loaded yet; first poll after load enriches
+        for ev in events:
+            if ev.method is not UnlockMethod.UNKNOWN or not ev.user_id:
+                continue
+            user = cache.get(ev.user_id)
+            if user is None:
+                # user ids in events are per-message; fall back to name match
+                matches = [u for u in cache.values() if u.name == ev.user]
+                user = matches[0] if matches else None
+            if user is None:
+                continue
+            method_map = {
+                LockUserType.FINGER: UnlockMethod.FINGER,
+                LockUserType.PASSWORD: UnlockMethod.PASSWORD,
+                LockUserType.CARD: UnlockMethod.CARD,
+                LockUserType.NFC: UnlockMethod.NFC,
+                LockUserType.FACE: UnlockMethod.FACE,
+            }
+            ev.method = method_map.get(user.type, UnlockMethod.UNKNOWN)
 
     def _parse_events(self, device_id: str, body: Any) -> list[LockEvent]:
         events: list[LockEvent] = []
@@ -624,16 +783,19 @@ class FcClient:
             # local.open carries the credential user name (fingerprint/
             # password owner); infer the method from the user name hints
             if method is None and etype is LockEventType.UNLOCKED:
-                low = (message_key + " " + user).lower()
+                low = (message_key + " " + user + " " + description).lower()
                 if "bluetooth" in low:
                     method = UnlockMethod.APP
                 elif any(t in low for t in ("finger", "pulgar", "huella")):
                     method = UnlockMethod.FINGER
-                elif any(t in low for t in ("password", "pin", "timeliness")):
+                elif any(t in low for t in ("password", "pin", "timeliness", "dynamic")):
                     method = UnlockMethod.PASSWORD
                 elif "card" in low:
                     method = UnlockMethod.CARD
                 else:
+                    # cloud only reports the credential OWNER, not the
+                    # method; admins open with fingerprint by default on
+                    # this model — mark unknown rather than guess
                     method = UnlockMethod.UNKNOWN
 
             return LockEvent(

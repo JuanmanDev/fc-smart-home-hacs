@@ -5,7 +5,8 @@
         "title": "FC SmartHome (Cerradura Inteligente Fingerchip)",
         "description": "Conectate a tu cuenta de FC SmartHome (Fingerchip).",
         "data": {
-          "email": "Correo electronico",
+          "email": "Correo o Telefono con Prefijo (ej. +34600112233 o correo@ejemplo.com)",
+          "country_code": "Prefijo telefonico (solo digitos, ej. 34)",
           "token": "Token de sesion (capturado de la app)",
           "family_id": "ID de Familia (opcional)",
           "password": "Contrasena (opcional si se proporciona Token)",
