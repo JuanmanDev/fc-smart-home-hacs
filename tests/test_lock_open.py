@@ -74,8 +74,12 @@ from custom_components.fc_smarthome.lock import (  # noqa: E402
 )
 
 
-def _make_lock(ble_available: bool) -> tuple[FCLock, dict]:
-    """Build an FCLock with mocked coordinator/router and call counters."""
+def _make_lock(ble_available: bool, ble_result: str = "ok") -> tuple[FCLock, dict]:
+    """Build an FCLock with mocked coordinator/router and call counters.
+
+    ble_result: "ok" (BLE succeeds), "fail" (BLE raises), "reject"
+    (BLE returns success=False).
+    """
     coord = MagicMock()
     coord.devices = {"d1": MagicMock()}
     coord.async_request_refresh = AsyncMock()
@@ -86,8 +90,14 @@ def _make_lock(ble_available: bool) -> tuple[FCLock, dict]:
     router = MagicMock()
     if ble_available:
         router.ble_manager = MagicMock()
-        router.unlock = AsyncMock(return_value=MagicMock(
-            success=True, message="unlocked via BLE"))
+        if ble_result == "ok":
+            router.unlock = AsyncMock(return_value=MagicMock(
+                success=True, message="unlocked via BLE"))
+        elif ble_result == "fail":
+            router.unlock = AsyncMock(side_effect=RuntimeError("GATT timeout"))
+        else:
+            router.unlock = AsyncMock(return_value=MagicMock(
+                success=False, message="BLE unlock returned failure"))
         router.latch = AsyncMock()
     else:
         router.ble_manager = None
@@ -161,6 +171,31 @@ async def test_open_is_reject_while_busy():
     lock._busy = "opening"
     with pytest.raises(HomeAssistantError, match="already running"):
         await lock.async_open()
+
+
+@pytest.mark.asyncio
+async def test_open_ble_present_but_fails_falls_back_to_cloud(monkeypatch):
+    """BLE path exists but errors (weak RSSI GATT timeout): async_open must
+    degrade to the cloud retry flow with guidance, not surface the BLE
+    exception."""
+    _short_window(monkeypatch)
+    lock, counters = _make_lock(ble_available=True, ble_result="fail")
+    with pytest.raises(HomeAssistantError) as exc:
+        await lock.async_open()
+    assert WAKE_GUIDANCE in str(exc.value)
+    counters["client_unlock"].assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_open_ble_rejects_result_falls_back_to_cloud(monkeypatch):
+    """BLE returns success=False (lock did not confirm): same degradation
+    contract as a raised error."""
+    _short_window(monkeypatch)
+    lock, counters = _make_lock(ble_available=True, ble_result="reject")
+    with pytest.raises(HomeAssistantError) as exc:
+        await lock.async_open()
+    assert WAKE_GUIDANCE in str(exc.value)
+    counters["client_unlock"].assert_awaited()
 
 
 def test_retry_constants_match_wake_window():
