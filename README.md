@@ -1,3 +1,12 @@
+> [!WARNING]
+> # ⚠️ REPOSITORIO TRASLADADO / REPOSITORY MOVED
+> **Este repositorio ha sido archivado y trasladado.**
+>
+> La versión oficial y activa de la integración para Home Assistant y HACS se encuentra en:
+> 👉 **[https://github.com/JuanmanDev/fc-smart-home-assistant](https://github.com/JuanmanDev/fc-smart-home-assistant)**
+>
+> Por favor, usa el nuevo repositorio para instalaciones, issues y actualizaciones.
+
 <p align="center">
   <img src="images/icon.png" width="128" height="128" alt="FC SmartHome logo">
 </p>
